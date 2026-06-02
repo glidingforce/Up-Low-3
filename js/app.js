@@ -135,7 +135,7 @@ let currentUser = null;
 function signInWithGoogle(){
   if(typeof GOOGLE_CLIENT_ID==='undefined'||!GOOGLE_CLIENT_ID){alert(t('googleNotConfigured'));return;}
   const redir = window.location.origin+window.location.pathname;
-  const p = new URLSearchParams({client_id:GOOGLE_CLIENT_ID,redirect_uri:redir,response_type:'token',scope:'openid email profile https://www.googleapis.com/auth/drive.appdata',prompt:'select_account'});
+  const p = new URLSearchParams({client_id:GOOGLE_CLIENT_ID,redirect_uri:redir,response_type:'token',scope:'openid email profile https://www.googleapis.com/auth/drive.file',prompt:'select_account'});
   window.location.href='https://accounts.google.com/o/oauth2/v2/auth?'+p;
 }
 
@@ -153,6 +153,7 @@ async function handleOAuthCallback(){
     currentUser={id:d.sub,name:d.name||'',email:d.email||'',picture:d.picture||'',provider:'google'};
     localStorage.setItem('nu_current_user',JSON.stringify(currentUser));
     storeToken(token); // save for Drive sync
+    setTimeout(checkDriveOnLogin, 400); // check after login
     return true;
   }catch(e){console.error('OAuth error',e);return false;}
 }
@@ -165,127 +166,200 @@ function signOut(){
 }
 
 
-// ─── Google Drive Sync ────────────────────────────────────
-// Saves/loads all workout data to a hidden app-only file in
-// the user's Google Drive — syncs seamlessly across devices.
-let _token = null, _driveFileId = null, _syncDebounce = null;
+// ─── Google Drive Sync — Excel file approach ─────────────
+// Stores workouts as "NextUp Workouts.xlsx" in user's Google Drive.
+// User can edit the file directly in Google Sheets, then sync back.
+const DRIVE_XLS_NAME = 'NextUp Workouts.xlsx';
+let _token = null, _driveFileId = null;
 let _syncStatus = 'idle'; // idle | syncing | ok | error
 
-const DRIVE_FILENAME = 'nextup-workouts.json';
-
 function storeToken(t){
-  _token = t;
-  try{ localStorage.setItem('nu_tok', JSON.stringify({t, exp: Date.now()+55*60*1000})); }catch(e){}
+  _token=t;
+  try{localStorage.setItem('nu_tok',JSON.stringify({t,exp:Date.now()+55*60*1000}));}catch(e){}
 }
 function getToken(){
   if(_token) return _token;
   try{
-    const s = localStorage.getItem('nu_tok');
-    if(!s) return null;
-    const {t, exp} = JSON.parse(s);
-    if(Date.now() > exp){ localStorage.removeItem('nu_tok'); return null; }
-    _token = t; return t;
-  }catch(e){ return null; }
+    const s=localStorage.getItem('nu_tok'); if(!s) return null;
+    const {t,exp}=JSON.parse(s);
+    if(Date.now()>exp){localStorage.removeItem('nu_tok');return null;}
+    _token=t; return t;
+  }catch(e){return null;}
 }
 
 function _setSyncStatus(s){
-  _syncStatus = s;
-  const el = document.getElementById('sync-ind');
-  if(!el) return;
-  const map = {idle:'☁', syncing:'🔄', ok:'✅', error:'⚠️'};
-  el.textContent = map[s] || '';
-  el.title = s==='ok'?'Synced to Google Drive':
-             s==='syncing'?'Syncing...':
-             s==='error'?'Sync failed — check Drive API is enabled':'';
+  _syncStatus=s;
+  const el=document.getElementById('sync-ind'); if(!el) return;
+  const map={idle:'☁',syncing:'🔄',ok:'✅',error:'⚠️'};
+  el.textContent=map[s]||'';
+  el.title=s==='ok'?'Synced — '+DRIVE_XLS_NAME:
+           s==='syncing'?'Syncing...':
+           s==='error'?'Sync error — see console':'Tap to sync';
 }
 
-async function loadFromDrive(){
-  const tok = getToken();
-  if(!tok || !currentUser) return;
+// ── Build Excel from current workouts ──────────────────────
+function _workoutsToXlsBytes(){
+  if(typeof XLSX==='undefined') return null;
+  const rows=[['Group','Icon','Exercise Name','Sets','Reps','Weight kg','Rest sec','Notes']];
+  S.workouts.forEach(w=>{
+    w.exercises.forEach(ex=>{
+      rows.push([w.name,w.icon,ex.name,ex.sets,ex.reps,ex.weight,ex.rest,ex.notes||'']);
+    });
+  });
+  const wb=XLSX.utils.book_new();
+  const ws=XLSX.utils.aoa_to_sheet(rows);
+  ws['!cols']=[{wch:16},{wch:6},{wch:26},{wch:6},{wch:8},{wch:10},{wch:10},{wch:40}];
+  XLSX.utils.book_append_sheet(wb,ws,'Workouts');
+  return XLSX.write(wb,{type:'array',bookType:'xlsx'});
+}
+
+// ── Parse Excel bytes → workouts array ────────────────────
+function _xlsBytesToWorkouts(bytes){
+  if(typeof XLSX==='undefined') return null;
+  const wb=XLSX.read(bytes,{type:'array'});
+  const ws=wb.Sheets[wb.SheetNames[0]];
+  const rows=XLSX.utils.sheet_to_json(ws,{header:1});
+  if(!rows||rows.length<2) return null;
+  const groups={},order=[];
+  rows.slice(1).filter(r=>r[0]&&r[2]).forEach(r=>{
+    const gn=String(r[0]||'').trim(),gi=String(r[1]||'💪').trim(),n=String(r[2]||'').trim();
+    if(!gn||!n) return;
+    if(!groups[gn]){groups[gn]={name:gn,icon:gi,exercises:[]};order.push(gn);}
+    const gx=groups[gn].exercises;
+    gx.push({id:gx.length+1,name:n,sets:parseInt(r[3])||3,reps:String(r[4]||'10').trim(),
+      weight:parseFloat(r[5])||0,rest:parseInt(r[6])||60,notes:String(r[7]||'').trim()});
+  });
+  if(!order.length) return null;
+  return order.map(gn=>({key:'xls_'+gn.replace(/\s+/g,'_').toLowerCase()+'_'+Date.now(), ...groups[gn]}));
+}
+
+// ── Find file on Drive ─────────────────────────────────────
+async function _findDriveFile(tok){
+  // Try cached ID first
+  const cached=localStorage.getItem('nu_drive_fid');
+  if(cached){
+    const r=await fetch('https://www.googleapis.com/drive/v3/files/'+cached+'?fields=id,name',
+      {headers:{Authorization:'Bearer '+tok}});
+    if(r.ok) return (await r.json()).id;
+    localStorage.removeItem('nu_drive_fid');
+  }
+  // Search by name
+  const r=await fetch(
+    "https://www.googleapis.com/drive/v3/files?q=name='"+encodeURIComponent(DRIVE_XLS_NAME)+"' and trashed=false&fields=files(id,name,modifiedTime)&orderBy=modifiedTime desc",
+    {headers:{Authorization:'Bearer '+tok}});
+  if(!r.ok) throw new Error('search '+r.status);
+  const d=await r.json();
+  if(d.files&&d.files.length){
+    const id=d.files[0].id;
+    localStorage.setItem('nu_drive_fid',id);
+    return id;
+  }
+  return null;
+}
+
+// ── Upload (create or update) Excel to Drive ──────────────
+async function _uploadDrive(tok, bytes, existingId){
+  const blob=new Blob([bytes],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+  let url,method;
+  if(existingId){
+    url='https://www.googleapis.com/upload/drive/v3/files/'+existingId+'?uploadType=media';
+    method='PATCH';
+  } else {
+    // Create with metadata
+    const meta=JSON.stringify({name:DRIVE_XLS_NAME});
+    const boundary='nu_bound';
+    const body='--'+boundary+'\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n'+
+      meta+'\r\n--'+boundary+'\r\nContent-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\n';
+    // Use multipart
+    const mp=new Blob([body,'[binary xlsx data]','\r\n--'+boundary+'--']);
+    // Actually use two-step: create metadata, then upload content
+    const cr=await fetch('https://www.googleapis.com/drive/v3/files',{
+      method:'POST',
+      headers:{Authorization:'Bearer '+tok,'Content-Type':'application/json'},
+      body:meta});
+    if(!cr.ok) throw new Error('create meta '+cr.status);
+    const cd=await cr.json();
+    existingId=cd.id;
+    url='https://www.googleapis.com/upload/drive/v3/files/'+existingId+'?uploadType=media';
+    method='PATCH';
+    localStorage.setItem('nu_drive_fid',existingId);
+    _driveFileId=existingId;
+  }
+  const r=await fetch(url,{method,headers:{Authorization:'Bearer '+tok,
+    'Content-Type':'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'},body:blob});
+  if(!r.ok) throw new Error('upload '+r.status);
+  return existingId;
+}
+
+// ── SYNC: App → Drive ──────────────────────────────────────
+async function syncAppToDrive(){
+  const tok=getToken(); if(!tok||!currentUser){alert('Please log in first');return;}
   _setSyncStatus('syncing');
   try{
-    // 1. Find file in appDataFolder
-    const sr = await fetch(
-      "https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=name='"+DRIVE_FILENAME+"'&fields=files(id)",
-      {headers:{Authorization:'Bearer '+tok}}
-    );
-    if(!sr.ok) throw new Error(sr.status);
-    const sd = await sr.json();
-
-    if(!sd.files || !sd.files.length){
-      // No file yet — push current local data up
-      _setSyncStatus('ok');
-      saveToDrive();
-      return;
-    }
-    _driveFileId = sd.files[0].id;
-
-    // 2. Read file content
-    const fr = await fetch(
-      "https://www.googleapis.com/drive/v3/files/"+_driveFileId+"?alt=media",
-      {headers:{Authorization:'Bearer '+tok}}
-    );
-    if(!fr.ok) throw new Error(fr.status);
-    const data = await fr.json();
-
-    // 3. Apply Drive data → overrides local
-    if(data.workouts && data.workouts.length){
-      localStorage.setItem(sk('workouts'), JSON.stringify(data.workouts));
-      S.workouts = data.workouts;
-    }
-    if(data.history){
-      localStorage.setItem(sk('history'), JSON.stringify(data.history));
-      S.history = data.history;
-    }
-    if(data.profile) localStorage.setItem(sk('profile'), JSON.stringify(data.profile));
-
+    const bytes=_workoutsToXlsBytes();
+    if(!bytes) throw new Error('SheetJS not loaded');
+    let fid=await _findDriveFile(tok).catch(()=>null);
+    fid=await _uploadDrive(tok,bytes,fid);
+    _driveFileId=fid;
+    localStorage.setItem('nu_drive_fid',fid);
     _setSyncStatus('ok');
-    render(); // re-render with synced data
-  }catch(e){
-    console.error('Drive load:', e);
-    _setSyncStatus('error');
-  }
+    alert('✅ Workouts saved to Google Drive\n'+DRIVE_XLS_NAME);
+  }catch(e){console.error('syncAppToDrive',e);_setSyncStatus('error');alert('Sync failed: '+e.message);}
 }
 
-function saveToDrive(){
-  const tok = getToken();
-  if(!tok || !currentUser) return;
-  // Debounce — wait 2.5 s after last change before uploading
-  clearTimeout(_syncDebounce);
-  _syncDebounce = setTimeout(async ()=>{
-    _setSyncStatus('syncing');
-    const payload = JSON.stringify({
-      workouts: S.workouts, history: S.history,
-      profile: getProfile(), savedAt: new Date().toISOString()
-    });
-    try{
-      if(_driveFileId){
-        // Update existing file
-        const r = await fetch(
-          "https://www.googleapis.com/upload/drive/v3/files/"+_driveFileId+"?uploadType=media",
-          {method:'PATCH',headers:{Authorization:'Bearer '+tok,'Content-Type':'application/json'},body:payload}
-        );
-        if(!r.ok) throw new Error(r.status);
-      } else {
-        // Create new file in appDataFolder
-        const b = 'nu_'+Date.now();
-        const meta = JSON.stringify({name:DRIVE_FILENAME,parents:['appDataFolder']});
-        const body = '--'+b+'\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n'+
-          meta+'\r\n--'+b+'\r\nContent-Type: application/json\r\n\r\n'+
-          payload+'\r\n--'+b+'--';
-        const r = await fetch(
-          'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id',
-          {method:'POST',headers:{Authorization:'Bearer '+tok,'Content-Type':'multipart/related; boundary='+b},body}
-        );
-        if(!r.ok) throw new Error(r.status);
-        _driveFileId = (await r.json()).id;
+// ── SYNC: Drive → App ──────────────────────────────────────
+async function syncDriveToApp(){
+  const tok=getToken(); if(!tok||!currentUser){alert('Please log in first');return;}
+  _setSyncStatus('syncing');
+  try{
+    const fid=await _findDriveFile(tok);
+    if(!fid){
+      _setSyncStatus('idle');
+      if(confirm('No file found on Drive.\nCreate "'+DRIVE_XLS_NAME+'" from current workouts?')){
+        await syncAppToDrive();
       }
-      _setSyncStatus('ok');
-    }catch(e){
-      console.error('Drive save:', e);
-      _setSyncStatus('error');
+      return;
     }
-  }, 2500);
+    _driveFileId=fid;
+    const r=await fetch('https://www.googleapis.com/drive/v3/files/'+fid+'?alt=media',
+      {headers:{Authorization:'Bearer '+tok}});
+    if(!r.ok) throw new Error('download '+r.status);
+    const buf=await r.arrayBuffer();
+    const workouts=_xlsBytesToWorkouts(new Uint8Array(buf));
+    if(!workouts) throw new Error('Could not parse Excel file');
+    S.workouts=workouts;
+    saveWorkouts();
+    _setSyncStatus('ok');
+    render();
+    alert('✅ Workouts loaded from Google Drive\n'+DRIVE_XLS_NAME);
+  }catch(e){console.error('syncDriveToApp',e);_setSyncStatus('error');alert('Sync failed: '+e.message);}
+}
+
+// ── Initial Drive check after login ───────────────────────
+async function checkDriveOnLogin(){
+  const tok=getToken(); if(!tok||!currentUser) return;
+  _setSyncStatus('syncing');
+  try{
+    const fid=await _findDriveFile(tok);
+    if(fid){
+      _driveFileId=fid; _setSyncStatus('ok');
+      // Ask user if they want to load from Drive
+      if(confirm('Found "'+DRIVE_XLS_NAME+'" on your Google Drive.\nLoad workouts from Drive?')){
+        await syncDriveToApp();
+      } else {
+        _setSyncStatus('ok');
+      }
+    } else {
+      // No file yet — create one silently
+      _setSyncStatus('syncing');
+      const bytes=_workoutsToXlsBytes();
+      if(bytes){
+        const fid2=await _uploadDrive(tok,bytes,null);
+        _driveFileId=fid2; _setSyncStatus('ok');
+        alert('Created "'+DRIVE_XLS_NAME+'" in your Google Drive.\nYou can now edit it and sync back!');
+      }
+    }
+  }catch(e){console.error('checkDriveOnLogin',e);_setSyncStatus('error');}
 }
 
 // ─── State ────────────────────────────────────────────────
@@ -298,7 +372,7 @@ const S={screen:'home',workouts:[],history:[],
 // ─── Storage (namespaced per user) ────────────────────────
 function sk(k){return 'nu_'+(currentUser?currentUser.id:'guest')+'_'+k;}
 function loadData(){const w=localStorage.getItem(sk('workouts'));S.workouts=w?JSON.parse(w):JSON.parse(JSON.stringify(DEFAULT_WORKOUTS));const h=localStorage.getItem(sk('history'));S.history=h?JSON.parse(h):[];}
-function saveWorkouts(){localStorage.setItem(sk('workouts'),JSON.stringify(S.workouts));saveToDrive();}
+function saveWorkouts(){localStorage.setItem(sk('workouts'),JSON.stringify(S.workouts));}
 function saveHistory() {localStorage.setItem(sk('history'), JSON.stringify(S.history));}
 function getImg(wk,id){return localStorage.getItem(sk('img_'+wk+'_'+id));}
 function setImg(wk,id,d){localStorage.setItem(sk('img_'+wk+'_'+id),d);}
@@ -313,13 +387,27 @@ function profileSubtitle(){const p=getProfile();const parts=[];if(p.name)parts.p
 
 
 // ─── Speech Synthesis ─────────────────────────────────────
+let _speechUnlocked=false;
+
+function _unlockSpeech(){
+  // Must be called from a user-gesture click handler (e.g. Start button)
+  if(_speechUnlocked||!window.speechSynthesis) return;
+  const u=new SpeechSynthesisUtterance('');
+  u.volume=0; u.rate=2;
+  window.speechSynthesis.speak(u);
+  _speechUnlocked=true;
+}
+
 function _speak(text){
   if(localStorage.getItem('nu_mute')==='1') return;
   if(!window.speechSynthesis) return;
+  // Retry-friendly: if synthesis is paused (iOS background), resume it
+  if(window.speechSynthesis.paused) window.speechSynthesis.resume();
   window.speechSynthesis.cancel();
   const u=new SpeechSynthesisUtterance(text);
   u.lang=lang==='he'?'he-IL':'en-US';
-  u.rate=1.05; u.volume=1;
+  u.rate=0.95; u.volume=1;
+  u.pitch=1;
   window.speechSynthesis.speak(u);
 }
 function _muted(){ return localStorage.getItem('nu_mute')==='1'; }
@@ -559,6 +647,22 @@ function renderModal(){
       '<button class="btn btn-ghost" data-a="closeModal">'+t('cancel')+'</button>'+
       '<button class="btn btn-primary" data-a="saveGroup" data-wi="'+wi+'">'+t('save')+'</button>'+
       '</div>';
+  } else if(S.modal.type==='syncDrive'){
+    const hasToken = !!getToken();
+    const note = hasToken
+      ? (lang==='he'?'בחר כיוון סנכרון:':'Choose sync direction:')
+      : (lang==='he'?'התחבר כדי לסנכרן':'Log in to sync');
+    inner='<div class="modal-title">☁ '+(lang==='he'?'סנכרון עם Drive':'Sync with Drive')+'</div>'+
+      '<p style="color:var(--gray);font-size:13px;text-align:center;margin-bottom:20px;">'+note+'</p>'+
+      '<div style="display:flex;flex-direction:column;gap:12px;">'+
+      '<button class="btn btn-primary" data-a="syncAppToDrive">⬆ '+(lang==='he'?'אפליקציה → Drive':'App → Drive')+'</button>'+
+      '<p style="color:var(--gray);font-size:11px;text-align:center;margin:-6px 0 0;">'+
+      (lang==='he'?'מחליף את הקובץ ב-Drive בנתוני האפליקציה':'Overwrites the Drive file with current app data')+'</p>'+
+      '<button class="btn btn-ghost" data-a="syncDriveToApp">⬇ '+(lang==='he'?'Drive → אפליקציה':'Drive → App')+'</button>'+
+      '<p style="color:var(--gray);font-size:11px;text-align:center;margin:-6px 0 0;">'+
+      (lang==='he'?'מחליף נתוני האפליקציה מהקובץ ב-Drive':'Overwrites app data with the Drive Excel file')+'</p>'+
+      '</div>'+
+      '<div class="mt-16"><button class="btn btn-ghost" data-a="closeModal">'+t('cancel')+'</button></div>';
   } else if(S.modal.type==='profile'){
     inner=buildProfileModal();
   }
@@ -678,6 +782,7 @@ function skipRest(){const d=S.rest.onDone;S.rest.onDone=null;stopRest();if(d)d()
 function startWorkout(wi){S.session={workoutIdx:wi,exerciseIdx:0,setNum:1};S.screen='workout';render();}
 
 function doSet(){
+  _unlockSpeech(); // must be called from user gesture before any speech
   const{workoutIdx:wi,exerciseIdx:ei,setNum}=S.session;
   const w=S.workouts[wi],ex=w.exercises[ei];
   const lastSet=setNum===ex.sets,lastEx=ei===w.exercises.length-1;
@@ -713,7 +818,9 @@ document.addEventListener('click',function(e){
   if(a==='skipRest')     {skipRest();return;}
   if(a==='exitW')        {if(confirm(t('exitWorkout'))){stopRest();go('home');}return;}
   if(a==='signOut')      {signOut();closeModal();return;}
-  if(a==='syncNow')      {_driveFileId=null;loadFromDrive();return;}
+  if(a==='syncNow')      {openModal('syncDrive',{});return;}
+  if(a==='syncAppToDrive'){closeModal();syncAppToDrive();return;}
+  if(a==='syncDriveToApp'){closeModal();syncDriveToApp();return;}
   if(a==='toggleMute')   {_toggleMute();return;}
   if(a==='editGroupName'){
     const wi=+T.dataset.wi,w=S.workouts[wi];
@@ -864,7 +971,7 @@ async function initApp(){
 
   // 1. Handle Google OAuth redirect callback
   const fromGoogle = await handleOAuthCallback();
-  if(fromGoogle && currentUser){ loadFromDrive(); }
+  // Drive check handled inside handleOAuthCallback via checkDriveOnLogin
 
   // 2. Restore saved user (if not fresh from OAuth)
   if(!currentUser){
@@ -876,10 +983,9 @@ async function initApp(){
   loadData();
   render();
 
-  // 4. If user is already logged in and has a valid token, sync from Drive
-  if(currentUser && getToken()){
-    loadFromDrive(); // async — will re-render when done
-  }
+  // 4. Restore cached Drive file ID
+  const cachedFid = localStorage.getItem('nu_drive_fid');
+  if(cachedFid) _driveFileId = cachedFid;
 }
 
 initApp();
