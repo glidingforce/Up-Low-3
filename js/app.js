@@ -50,6 +50,10 @@ const TR = {
     heightUnit_m:'cm', heightUnit_i:'ft / in',
     weightUnit_m:'kg', weightUnit_i:'lbs',
     errAge:'Age must be between 1 and 120',
+    editGroup:'Edit Group',
+    tenSecsLeft:'10 seconds left',
+    countThree:'Three',countTwo:'Two',countOne:'One',goNow:'Go!',
+    muteOn:'🔇',muteOff:'🔊',
     errHeightM:'Height must be 50–272 cm',
     errHeightI:'Height must be 1\'8\" – 8\'11\"',
     errWeightM:'Weight must be 20–400 kg',
@@ -96,6 +100,10 @@ const TR = {
     heightUnit_m:'ס"מ', heightUnit_i:'ft / in',
     weightUnit_m:'ק"ג', weightUnit_i:'לב\'',
     errAge:'גיל חייב להיות בין 1 ל-120',
+    editGroup:'עריכת קבוצה',
+    tenSecsLeft:'10 שניות נשארו',
+    countThree:'שלוש',countTwo:'שתיים',countOne:'אחת',goNow:'קדימה!',
+    muteOn:'🔇',muteOff:'🔊',
     errHeightM:'גובה חייב להיות 50–272 ס"מ',
     errHeightI:'גובה חייב להיות בין 1\'8" ל-8\'11"',
     errWeightM:'משקל חייב להיות 20–400 ק"ג',
@@ -127,7 +135,7 @@ let currentUser = null;
 function signInWithGoogle(){
   if(typeof GOOGLE_CLIENT_ID==='undefined'||!GOOGLE_CLIENT_ID){alert(t('googleNotConfigured'));return;}
   const redir = window.location.origin+window.location.pathname;
-  const p = new URLSearchParams({client_id:GOOGLE_CLIENT_ID,redirect_uri:redir,response_type:'token',scope:'openid email profile',prompt:'select_account'});
+  const p = new URLSearchParams({client_id:GOOGLE_CLIENT_ID,redirect_uri:redir,response_type:'token',scope:'openid email profile https://www.googleapis.com/auth/drive.appdata',prompt:'select_account'});
   window.location.href='https://accounts.google.com/o/oauth2/v2/auth?'+p;
 }
 
@@ -144,14 +152,140 @@ async function handleOAuthCallback(){
     if(d.error){console.error(d.error);return false;}
     currentUser={id:d.sub,name:d.name||'',email:d.email||'',picture:d.picture||'',provider:'google'};
     localStorage.setItem('nu_current_user',JSON.stringify(currentUser));
+    storeToken(token); // save for Drive sync
     return true;
   }catch(e){console.error('OAuth error',e);return false;}
 }
 
 function signOut(){
-  currentUser=null;
+  currentUser=null; _token=null; _driveFileId=null;
   localStorage.removeItem('nu_current_user');
+  localStorage.removeItem('nu_tok');
   loadData();render();
+}
+
+
+// ─── Google Drive Sync ────────────────────────────────────
+// Saves/loads all workout data to a hidden app-only file in
+// the user's Google Drive — syncs seamlessly across devices.
+let _token = null, _driveFileId = null, _syncDebounce = null;
+let _syncStatus = 'idle'; // idle | syncing | ok | error
+
+const DRIVE_FILENAME = 'nextup-workouts.json';
+
+function storeToken(t){
+  _token = t;
+  try{ localStorage.setItem('nu_tok', JSON.stringify({t, exp: Date.now()+55*60*1000})); }catch(e){}
+}
+function getToken(){
+  if(_token) return _token;
+  try{
+    const s = localStorage.getItem('nu_tok');
+    if(!s) return null;
+    const {t, exp} = JSON.parse(s);
+    if(Date.now() > exp){ localStorage.removeItem('nu_tok'); return null; }
+    _token = t; return t;
+  }catch(e){ return null; }
+}
+
+function _setSyncStatus(s){
+  _syncStatus = s;
+  const el = document.getElementById('sync-ind');
+  if(!el) return;
+  const map = {idle:'☁', syncing:'🔄', ok:'✅', error:'⚠️'};
+  el.textContent = map[s] || '';
+  el.title = s==='ok'?'Synced to Google Drive':
+             s==='syncing'?'Syncing...':
+             s==='error'?'Sync failed — check Drive API is enabled':'';
+}
+
+async function loadFromDrive(){
+  const tok = getToken();
+  if(!tok || !currentUser) return;
+  _setSyncStatus('syncing');
+  try{
+    // 1. Find file in appDataFolder
+    const sr = await fetch(
+      "https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=name='"+DRIVE_FILENAME+"'&fields=files(id)",
+      {headers:{Authorization:'Bearer '+tok}}
+    );
+    if(!sr.ok) throw new Error(sr.status);
+    const sd = await sr.json();
+
+    if(!sd.files || !sd.files.length){
+      // No file yet — push current local data up
+      _setSyncStatus('ok');
+      saveToDrive();
+      return;
+    }
+    _driveFileId = sd.files[0].id;
+
+    // 2. Read file content
+    const fr = await fetch(
+      "https://www.googleapis.com/drive/v3/files/"+_driveFileId+"?alt=media",
+      {headers:{Authorization:'Bearer '+tok}}
+    );
+    if(!fr.ok) throw new Error(fr.status);
+    const data = await fr.json();
+
+    // 3. Apply Drive data → overrides local
+    if(data.workouts && data.workouts.length){
+      localStorage.setItem(sk('workouts'), JSON.stringify(data.workouts));
+      S.workouts = data.workouts;
+    }
+    if(data.history){
+      localStorage.setItem(sk('history'), JSON.stringify(data.history));
+      S.history = data.history;
+    }
+    if(data.profile) localStorage.setItem(sk('profile'), JSON.stringify(data.profile));
+
+    _setSyncStatus('ok');
+    render(); // re-render with synced data
+  }catch(e){
+    console.error('Drive load:', e);
+    _setSyncStatus('error');
+  }
+}
+
+function saveToDrive(){
+  const tok = getToken();
+  if(!tok || !currentUser) return;
+  // Debounce — wait 2.5 s after last change before uploading
+  clearTimeout(_syncDebounce);
+  _syncDebounce = setTimeout(async ()=>{
+    _setSyncStatus('syncing');
+    const payload = JSON.stringify({
+      workouts: S.workouts, history: S.history,
+      profile: getProfile(), savedAt: new Date().toISOString()
+    });
+    try{
+      if(_driveFileId){
+        // Update existing file
+        const r = await fetch(
+          "https://www.googleapis.com/upload/drive/v3/files/"+_driveFileId+"?uploadType=media",
+          {method:'PATCH',headers:{Authorization:'Bearer '+tok,'Content-Type':'application/json'},body:payload}
+        );
+        if(!r.ok) throw new Error(r.status);
+      } else {
+        // Create new file in appDataFolder
+        const b = 'nu_'+Date.now();
+        const meta = JSON.stringify({name:DRIVE_FILENAME,parents:['appDataFolder']});
+        const body = '--'+b+'\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n'+
+          meta+'\r\n--'+b+'\r\nContent-Type: application/json\r\n\r\n'+
+          payload+'\r\n--'+b+'--';
+        const r = await fetch(
+          'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id',
+          {method:'POST',headers:{Authorization:'Bearer '+tok,'Content-Type':'multipart/related; boundary='+b},body}
+        );
+        if(!r.ok) throw new Error(r.status);
+        _driveFileId = (await r.json()).id;
+      }
+      _setSyncStatus('ok');
+    }catch(e){
+      console.error('Drive save:', e);
+      _setSyncStatus('error');
+    }
+  }, 2500);
 }
 
 // ─── State ────────────────────────────────────────────────
@@ -164,7 +298,7 @@ const S={screen:'home',workouts:[],history:[],
 // ─── Storage (namespaced per user) ────────────────────────
 function sk(k){return 'nu_'+(currentUser?currentUser.id:'guest')+'_'+k;}
 function loadData(){const w=localStorage.getItem(sk('workouts'));S.workouts=w?JSON.parse(w):JSON.parse(JSON.stringify(DEFAULT_WORKOUTS));const h=localStorage.getItem(sk('history'));S.history=h?JSON.parse(h):[];}
-function saveWorkouts(){localStorage.setItem(sk('workouts'),JSON.stringify(S.workouts));}
+function saveWorkouts(){localStorage.setItem(sk('workouts'),JSON.stringify(S.workouts));saveToDrive();}
 function saveHistory() {localStorage.setItem(sk('history'), JSON.stringify(S.history));}
 function getImg(wk,id){return localStorage.getItem(sk('img_'+wk+'_'+id));}
 function setImg(wk,id,d){localStorage.setItem(sk('img_'+wk+'_'+id),d);}
@@ -176,6 +310,26 @@ function saveProfile(p){localStorage.setItem(sk('profile'),JSON.stringify(p));}
 function calcBMI(w,h){if(!w||!h||h<=0)return null;return(parseFloat(w)/Math.pow(parseFloat(h)/100,2)).toFixed(1);}
 function bmiCat(b){if(!b)return null;const v=parseFloat(b);if(v<18.5)return{label:t('bmiUnder'),color:'#3498db'};if(v<25)return{label:t('bmiNormal'),color:'#2ecc71'};if(v<30)return{label:t('bmiOver'),color:'#f39c12'};return{label:t('bmiObese'),color:'#FF4A1C'};}
 function profileSubtitle(){const p=getProfile();const parts=[];if(p.name)parts.push(p.name);const b=calcBMI(p.weight,p.height);if(b){const c=bmiCat(b);parts.push('BMI '+b+' · '+c.label);}return parts.join(' · ');}
+
+
+// ─── Speech Synthesis ─────────────────────────────────────
+function _speak(text){
+  if(localStorage.getItem('nu_mute')==='1') return;
+  if(!window.speechSynthesis) return;
+  window.speechSynthesis.cancel();
+  const u=new SpeechSynthesisUtterance(text);
+  u.lang=lang==='he'?'he-IL':'en-US';
+  u.rate=1.05; u.volume=1;
+  window.speechSynthesis.speak(u);
+}
+function _muted(){ return localStorage.getItem('nu_mute')==='1'; }
+function _toggleMute(){
+  const m=_muted();
+  localStorage.setItem('nu_mute',m?'0':'1');
+  // update button if on rest screen
+  const btn=document.getElementById('mute-btn');
+  if(btn) btn.textContent=m?t('muteOff'):t('muteOn');
+}
 
 // ─── Utils ────────────────────────────────────────────────
 const $id=$=>document.getElementById($);
@@ -210,7 +364,8 @@ function renderHome(){
     ?'<button class="avatar-btn" data-a="openModal" data-type="profile"><img class="user-avatar-sm" src="'+esc(currentUser.picture)+'" onerror="this.parentElement.innerHTML=\'<div class=&quot;avatar-placeholder&quot; data-a=&quot;openModal&quot; data-type=&quot;profile&quot;>👤</div>\'"></button>'
     :'<div class="avatar-placeholder" data-a="openModal" data-type="profile">👤</div>';
   const cards=S.workouts.map((w,idx)=>'<div class="wcard"><div class="wcard-name">'+esc(w.icon)+' '+esc(w.name)+'</div><div class="wcard-count">'+w.exercises.length+' '+t(w.exercises.length!==1?'exercises':'exercise')+'</div><div class="wcard-btns"><button class="btn btn-primary btn-start" data-a="start" data-idx="'+idx+'">'+t('start')+'</button><button class="btn btn-ghost btn-edit" data-a="editW" data-idx="'+idx+'">'+t('edit')+'</button></div></div>').join('');
-  $app().innerHTML='<div class="home-wrap"><div class="home-topbar"><div class="home-logo"><img src="images/icon.png" class="app-icon" alt="" onerror="this.style.display=\'none\'"><div><div class="app-name">'+t('appName')+'</div>'+(sub?'<div class="app-sub">'+esc(sub)+'</div>':'<div class="app-sub" data-a="openModal" data-type="profile" style="cursor:pointer;color:var(--teal);">'+t('setupProfile')+' →</div>')+'</div></div><div class="home-actions">'+avatar+'<button class="lang-btn" data-a="toggleLang">'+t('language')+'</button><button class="close-btn" data-a="closeApp">✕</button></div></div>'+(S.history.length?'<p class="sec-label">'+t('recentSessions')+'</p><div class="hist-strip">'+chips+'</div>':'')+'<p class="sec-label">'+t('workouts')+'</p>'+cards+'<div style="margin-top:8px;"><button class="btn-add" data-a="openModal" data-type="addWorkout">'+t('addWorkout')+'</button><button class="btn-add btn-import" data-a="openModal" data-type="importExport">⬆⬇ '+t('importExport')+'</button></div></div>';
+  $app().innerHTML='<div class="home-wrap"><div class="home-topbar"><div class="home-logo"><img src="images/icon.png" class="app-icon" alt="" onerror="this.style.display=\'none\'"><div><div class="app-name">'+t('appName')+'</div>'+(sub?'<div class="app-sub">'+esc(sub)+'</div>':'<div class="app-sub" data-a="openModal" data-type="profile" style="cursor:pointer;color:var(--teal);">'+t('setupProfile')+' →</div>')+'</div></div><div class="home-actions">'+avatar+(currentUser?'<span id="sync-ind" class="sync-ind" data-a="syncNow" title="Sync to Drive">☁</span>':'')+
+    '<button class="lang-btn" data-a="toggleLang">'+t('language')+'</button><button class="close-btn" data-a="closeApp">✕</button></div></div>'+(S.history.length?'<p class="sec-label">'+t('recentSessions')+'</p><div class="hist-strip">'+chips+'</div>':'')+'<p class="sec-label">'+t('workouts')+'</p>'+cards+'<div style="margin-top:8px;"><button class="btn-add" data-a="openModal" data-type="addWorkout">'+t('addWorkout')+'</button><button class="btn-add btn-import" data-a="openModal" data-type="importExport">⬆⬇ '+t('importExport')+'</button></div></div>';
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -219,7 +374,12 @@ function renderHome(){
 function renderEdit(){
   const wi=S.edit.workoutIdx,w=S.workouts[wi];
   const items=w.exercises.map((ex,ei)=>{const img=getImg(w.key,ex.id);return'<div class="exercise-item">'+(img?'<div class="ex-thumb"><img src="'+img+'" alt=""></div>':'<div class="ex-thumb">🏋️</div>')+'<div class="ex-info"><div class="ex-name">'+esc(ex.name)+'</div><div class="ex-meta">'+ex.sets+' × '+esc(ex.reps)+(ex.weight>0?' · '+ex.weight+t('weightUnit'):'')+'</div></div><div class="ex-actions"><button class="btn-icon" data-a="editEx" data-wi="'+wi+'" data-ei="'+ei+'">✏️</button><button class="btn-icon" data-a="delEx" data-wi="'+wi+'" data-ei="'+ei+'">🗑️</button></div></div>';}).join('');
-  $app().innerHTML='<div class="screen-header"><button class="btn-back" data-a="home">'+t('back')+'</button><span class="screen-title">'+esc(w.icon)+' '+esc(w.name)+'</span><button class="btn-danger" data-a="promptDelW" data-wi="'+wi+'">'+t('delete')+'</button></div><div class="edit-wrap">'+items+'<button class="btn-add" data-a="addEx" data-wi="'+wi+'" style="margin-top:8px;">'+t('addExercise')+'</button></div>';
+  $app().innerHTML='<div class="screen-header"><button class="btn-back" data-a="home">'+t('back')+'</button>'+
+    '<span class="screen-title" style="display:flex;align-items:center;gap:6px;">'+
+    '<span>'+esc(w.icon)+' '+esc(w.name)+'</span>'+
+    '<button class="btn-icon" style="font-size:15px;padding:0 4px;" data-a="editGroupName" data-wi="'+wi+'">✏️</button>'+
+    '</span>'+
+    '<button class="btn-danger" data-a="promptDelW" data-wi="'+wi+'">'+t('delete')+'</button></div><div class="edit-wrap">'+items+'<button class="btn-add" data-a="addEx" data-wi="'+wi+'" style="margin-top:8px;">'+t('addExercise')+'</button></div>';
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -302,8 +462,11 @@ function renderRest(){
     '<p class="rest-next"><strong>'+nextLabel+'</strong></p>'+
     '</div>'+ // .rest-card
 
-    // skip button outside the card
+    // mute + skip row outside the card
+    '<div class="rest-actions-row">'+
+    '<button id="mute-btn" class="rest-mute-btn" data-a="toggleMute">'+(_muted()?t('muteOn'):t('muteOff'))+'</button>'+
     '<button class="rest-skip-btn" data-a="skipRest">'+t('skipRest')+'</button>'+
+    '</div>'+
     '</div>'; // .rest-screen
 }
 
@@ -384,6 +547,18 @@ function renderModal(){
     inner='<div class="modal-title">'+t('deleteWorkout')+'</div><p style="color:var(--gray);font-size:13px;text-align:center;margin-bottom:4px;">'+esc(wn)+'</p><p style="color:var(--gray);font-size:12px;text-align:center;margin-bottom:16px;">'+t('deleteHint')+'</p><div class="form-group"><label class="form-label">'+t('typeDeletePrompt')+'</label><input id="del-confirm-input" class="form-input" type="text" placeholder="'+t('typeDeletePlaceholder')+'" autocomplete="off"></div><div class="flex-gap mt-12"><button class="btn btn-ghost" data-a="closeModal">'+t('cancel')+'</button><button class="btn btn-red" id="del-ok-btn" data-a="confirmDelW" data-wi="'+wi+'" style="opacity:.4;cursor:not-allowed;" disabled>'+t('confirmDelete')+'</button></div>';
   } else if(S.modal.type==='importExport'){
     inner='<div class="modal-title">'+t('importExport')+'</div><p style="color:var(--gray);font-size:13px;text-align:center;margin-bottom:20px;">'+t('importNote')+'</p><div style="display:flex;flex-direction:column;gap:12px;"><button class="btn btn-primary" data-a="downloadTemplate">'+t('downloadTemplate')+'</button><div class="upload-area"><p>'+t('uploadFile')+'</p><input type="file" id="import-file" accept=".csv,.xlsx,.xls"></div></div><div class="mt-16"><button class="btn btn-ghost" data-a="closeModal">'+t('cancel')+'</button></div>';
+  } else if(S.modal.type==='editGroup'){
+    const wi=S.modal.data.wi;
+    const sel=(S.modal.data&&S.modal.data.icon)||'💪';
+    inner='<div class="modal-title">'+t('editGroup')+'</div>'+
+      '<div class="form-group"><label class="form-label">'+t('name')+'</label>'+
+      '<input id="modal-name" class="form-input" type="text" value="'+esc(S.modal.data.name||'')+'"></div>'+
+      '<div class="form-group"><label class="form-label">'+t('icon')+'</label>'+
+      '<div class="icon-grid">'+ICONS.map(ic=>'<button class="icon-btn'+(ic===sel?' selected':'')+'" data-a="selIcon" data-icon="'+ic+'">'+ic+'</button>').join('')+'</div></div>'+
+      '<div class="flex-gap mt-12">'+
+      '<button class="btn btn-ghost" data-a="closeModal">'+t('cancel')+'</button>'+
+      '<button class="btn btn-primary" data-a="saveGroup" data-wi="'+wi+'">'+t('save')+'</button>'+
+      '</div>';
   } else if(S.modal.type==='profile'){
     inner=buildProfileModal();
   }
@@ -479,7 +654,20 @@ function parseCSV(txt){return txt.split('\n').map(line=>{const r=[];let q=false,
 // ═══════════════════════════════════════════════════════════
 function startRest(sec,onDone){
   stopRest();S.rest={total:sec,remaining:sec,timer:null,onDone};S.screen='rest';render();
-  S.rest.timer=setInterval(()=>{S.rest.remaining--;if(S.rest.remaining<=0){const d=S.rest.onDone;S.rest.onDone=null;stopRest();if(d)d();else{S.screen='workout';render();}}else renderRest();},1000);
+  S.rest.timer=setInterval(()=>{
+    S.rest.remaining--;
+    const r=S.rest.remaining;
+    // Sound cues
+    if(r===10&&S.rest.total>=14) _speak(t('tenSecsLeft'));
+    if(r===3) _speak(t('countThree'));
+    if(r===2) _speak(t('countTwo'));
+    if(r===1) _speak(t('countOne'));
+    if(r<=0){
+      _speak(t('goNow'));
+      const d=S.rest.onDone;S.rest.onDone=null;stopRest();
+      if(d)d();else{S.screen='workout';render();}
+    }else renderRest();
+  },1000);
 }
 function stopRest(){if(S.rest.timer){clearInterval(S.rest.timer);S.rest.timer=null;}}
 function skipRest(){const d=S.rest.onDone;S.rest.onDone=null;stopRest();if(d)d();else{S.screen='workout';render();}}
@@ -525,6 +713,19 @@ document.addEventListener('click',function(e){
   if(a==='skipRest')     {skipRest();return;}
   if(a==='exitW')        {if(confirm(t('exitWorkout'))){stopRest();go('home');}return;}
   if(a==='signOut')      {signOut();closeModal();return;}
+  if(a==='syncNow')      {_driveFileId=null;loadFromDrive();return;}
+  if(a==='toggleMute')   {_toggleMute();return;}
+  if(a==='editGroupName'){
+    const wi=+T.dataset.wi,w=S.workouts[wi];
+    openModal('editGroup',{wi,name:w.name,icon:w.icon});return;
+  }
+  if(a==='saveGroup'){
+    const wi=+T.dataset.wi,nm=($id('modal-name')||{}).value||'';
+    if(!nm.trim()){alert(t('name')+'?');return;}
+    S.workouts[wi].name=nm.trim();
+    S.workouts[wi].icon=(S.modal.data&&S.modal.data.icon)||S.workouts[wi].icon;
+    saveWorkouts();closeModal();S.edit.workoutIdx=wi;S.screen='edit';render();return;
+  }
   if(a==='signInGoogle') {signInWithGoogle();return;}
   if(a==='editW')        {S.edit.workoutIdx=+T.dataset.idx;S.screen='edit';render();return;}
   if(a==='backEdit')     {S.screen='edit';render();return;}
@@ -663,6 +864,7 @@ async function initApp(){
 
   // 1. Handle Google OAuth redirect callback
   const fromGoogle = await handleOAuthCallback();
+  if(fromGoogle && currentUser){ loadFromDrive(); }
 
   // 2. Restore saved user (if not fresh from OAuth)
   if(!currentUser){
@@ -670,9 +872,14 @@ async function initApp(){
     if(saved){try{currentUser=JSON.parse(saved);}catch(e){}}
   }
 
-  // 3. Load data & render
+  // 3. Load data & initial render
   loadData();
   render();
+
+  // 4. If user is already logged in and has a valid token, sync from Drive
+  if(currentUser && getToken()){
+    loadFromDrive(); // async — will re-render when done
+  }
 }
 
 initApp();
